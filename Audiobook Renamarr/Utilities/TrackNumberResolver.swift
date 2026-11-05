@@ -1,80 +1,118 @@
 import Foundation
 
-/// Resolves track numbers for a multi-file book group using a sequential
-/// consistency check: the number "position" whose values form a complete,
-/// unbroken sequence across ALL files is the track number.
+/// Identifies which number in a set of filenames represents the track
+/// ordering by finding the number position that forms a complete,
+/// unbroken sequential set across all files.
 ///
-/// Example — 18 files named `The House of the Spirits - 001 - Chapter 1.mp3`
-/// where chapters only go to 14: the `001...018` sequence wins; chapter
-/// numbers (incomplete positions) are ignored.
-nonisolated enum TrackNumberResolver {
-    /// - Parameter sortedURLs: the group's files, sorted by filename.
-    /// - Returns: a mapping of URL → track number.
+/// Example:
+///   "The House of the Spirits - 001 - Chapter 1.mp3"  → numbers: [1, 1]
+///   "The House of the Spirits - 002 - Epigraph.mp3"   → numbers: [2]
+///   "The House of the Spirits - 003 - Chapter 2.mp3"  → numbers: [3, 2]
+///   ...
+///   "The House of the Spirits - 016 - Chapter 14.mp3" → numbers: [16, 14]
+///   "The House of the Spirits - 017 - Epilogue.mp3"   → numbers: [17]
+///   "The House of the Spirits - 018 - Close.mp3"      → numbers: [18]
+///
+///   Position 0 values: [1,2,3,4,5,...,18] → complete sequence ✅ → track numbers
+///   Position 1 values: [1,2,3,...,14, missing, missing] → incomplete ❌
+///
+enum TrackNumberResolver {
+
+    /// Given a sorted list of file URLs in a group, returns a dictionary
+    /// mapping each URL to its resolved track number.
+    ///
+    /// If no sequential number is found, falls back to sort-position (1-based).
     static func resolve(sortedURLs: [URL]) -> [URL: Int] {
         guard sortedURLs.count > 1 else {
-            // Single-file books: only use a track number if one was explicitly
-            // in the filename — never invent one. Handled by FilenameParser.
-            return [:]
+            // Single file — no sequence to check.
+            // Return whatever the filename parser found, or nil.
+            let parsed = FilenameParser.parse(sortedURLs[0], assumeTitleFirst: false)
+            return [sortedURLs[0]: parsed.trackNumber ?? 1]
         }
 
-        // 1. Extract all numbers from every filename (left → right),
-        //    excluding 4-digit years 1900–2099.
-        let numberLists: [[Int]] = sortedURLs.map { extractNumbers(from: $0.deletingPathExtension().lastPathComponent) }
+        // Extract all numbers from each filename, in left-to-right order.
+        let allNumbers: [[Int]] = sortedURLs.map { numbersInFilename($0) }
 
-        // 2. For each number position, check sequential completeness.
-        let minPositions = numberLists.map(\.count).min() ?? 0
-        var winningPosition: Int? = nil
+        // Find the maximum number of numeric positions across all files.
+        let maxPositions = allNumbers.map(\.count).max() ?? 0
 
-        for position in 0..<minPositions {
-            let values = numberLists.map { $0[position] }
-            if isCompleteSequence(values) {
-                winningPosition = position
-                break // 4. prefer the first (leftmost) qualifying position
+        // Check each position to see if it forms a valid sequence.
+        // A valid sequence: present in every file AND the values form
+        // a set of distinct integers that are consecutive (no gaps).
+        var bestPosition: Int? = nil
+        var bestValues: [Int] = []
+
+        for position in 0..<maxPositions {
+            // Collect values at this position — skip files that don't
+            // have a number at this position.
+            let values = allNumbers.compactMap { nums -> Int? in
+                position < nums.count ? nums[position] : nil
+            }
+
+            guard values.count == sortedURLs.count else {
+                // Not present in every file — can't be the track number.
+                continue
+            }
+
+            guard Set(values).count == values.count else {
+                // Duplicate values — not a sequence (e.g. series number
+                // repeated across all files).
+                continue
+            }
+
+            let sorted = values.sorted()
+            let isConsecutive = zip(sorted, sorted.dropFirst()).allSatisfy { $1 - $0 == 1 }
+            guard isConsecutive else { continue }
+
+            // Valid sequence found. Prefer zero-padded positions (earlier
+            // in the filename) when multiple qualify.
+            if bestPosition == nil {
+                bestPosition = position
+                bestValues   = values
             }
         }
 
+        if let _ = bestPosition {
+            // Map each URL to its resolved track number.
+            var result: [URL: Int] = [:]
+            for (index, url) in sortedURLs.enumerated() {
+                result[url] = bestValues[index]
+            }
+            return result
+        }
+
+        // No clean sequence found — fall back to sort position (1-based).
         var result: [URL: Int] = [:]
-        if let position = winningPosition {
-            for (index, url) in sortedURLs.enumerated() {
-                result[url] = numberLists[index][position]
-            }
-        } else {
-            // 5. Fall back to sort position (1-based).
-            for (index, url) in sortedURLs.enumerated() {
-                result[url] = index + 1
-            }
+        for (index, url) in sortedURLs.enumerated() {
+            // Try to use whatever the individual parser found first.
+            let parsed = FilenameParser.parse(url, assumeTitleFirst: false)
+            result[url] = parsed.trackNumber ?? (index + 1)
         }
         return result
     }
 
-    /// All integers in the string, in order, excluding likely years.
-    static func extractNumbers(from string: String) -> [Int] {
+    /// Extracts all non-year integers from a filename stem, left to right.
+    /// Years (1900–2099) are excluded since they are never track numbers.
+    private static func numbersInFilename(_ url: URL) -> [Int] {
+        let stem = url.deletingPathExtension().lastPathComponent
+
+        // Find all runs of digits in the filename.
         var numbers: [Int] = []
-        var current = ""
-        for char in string {
-            if char.isNumber {
-                current.append(char)
-            } else if !current.isEmpty {
-                appendIfNotYear(current, to: &numbers)
-                current = ""
+        let pattern = #"\d+"#
+        var searchRange = stem.startIndex..<stem.endIndex
+
+        while let range = stem.range(of: pattern, options: .regularExpression, range: searchRange) {
+            let digits = String(stem[range])
+            if let n = Int(digits) {
+                // Skip 4-digit years.
+                let isYear = digits.count == 4 && (n >= 1900 && n <= 2099)
+                if !isYear {
+                    numbers.append(n)
+                }
             }
+            searchRange = range.upperBound..<stem.endIndex
         }
-        if !current.isEmpty { appendIfNotYear(current, to: &numbers) }
+
         return numbers
-    }
-
-    private static func appendIfNotYear(_ digits: String, to numbers: inout [Int]) {
-        guard let value = Int(digits) else { return }
-        let isYear = digits.count == 4 && (1900...2099).contains(value)
-        if !isYear { numbers.append(value) }
-    }
-
-    /// True when the values form a complete unbroken run with no duplicates
-    /// (in any order), e.g. [3,1,2] → yes; [1,2,4] → no; [1,1,2] → no.
-    private static func isCompleteSequence(_ values: [Int]) -> Bool {
-        guard let minValue = values.min(), let maxValue = values.max() else { return false }
-        let unique = Set(values)
-        return unique.count == values.count
-            && maxValue - minValue + 1 == values.count
     }
 }

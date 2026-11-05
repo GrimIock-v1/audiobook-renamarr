@@ -1,711 +1,547 @@
 import Foundation
 import Combine
-import SwiftUI
 
-@MainActor
 final class LibraryViewModel: ObservableObject {
-
-    // MARK: - Published state
-
     @Published var items: [AudioFileItem] = []
-    @Published var sourceFolder: URL?
-    @Published var outputFolder: URL?
-    @Published var includeSubfolders = true
+    @Published var folderURL: URL?
+    @Published var outputFolderURL: URL?
+    @Published var rule = RenameRule()
+    @Published var dryRun: Bool = true
+    @Published var recursiveScan: Bool = true
     @Published var isScanning = false
     @Published var isMatching = false
     @Published var isRenaming = false
-    @Published var dryRun = true
-    @Published var copyInsteadOfMove = false
-    @Published var moveCompanionFiles = true
-    @Published var cleanupEmptyFolders = false
     @Published var statusMessage: String?
-    @Published var errorMessage: String?
-    @Published var matchProgress: Double = 0
-    @Published var renameProgress: Double = 0
-    @Published var currentlyProcessing: String?
-    @Published var collapsedFolders: Set<String> = []
-    @Published var showReviewOnly = false
-    /// Folders forced to search by folder name; persists across re-matches
-    /// in the same session.
     @Published var folderNameOverrides: Set<String> = []
-    /// The exact keywords last sent to Audible, per group — surfaced in the
-    /// UI so a failed search can be inspected and edited rather than retyped.
-    @Published var lastQueries: [String: String] = [:]
-    @Published var canUndoLastMove = false
-    @Published var rule: RenameRule = .default {
-        didSet { persistRule() }
-    }
 
-    // MARK: - Services
+    // Progress tracking
+    @Published var matchProgress: Double = 0   // 0.0 – 1.0
+    @Published var renameProgress: Double = 0  // 0.0 – 1.0
+    @Published var currentlyProcessing: String? = nil  // live filename log
 
-    private let scanner = FolderScanner()
-    private let tagReader = TagReader()
     private let metadataService: AudibleMetadataSearching
     private let cache = MetadataCache()
-    private let scorer = MatchScorer()
-    private let renameEngine = RenameEngine()
-    private let manifest = MoveManifest()
-
-    // Security-scoped access, held for session lifetime.
-    private var sourceAccessURL: URL?
-    private var outputAccessURL: URL?
-    /// Individually imported files (drag-in / file picker) each carry their
-    /// own security scope, retained for the session.
-    private var fileAccessURLs: [URL] = []
-
-    private static let ruleDefaultsKey = "renameRule"
-    private static let sourceBookmarkKey = "sourceFolderBookmark"
-    private static let outputBookmarkKey = "outputFolderBookmark"
+    private var securityScopedFolder: URL?
+    private var securityScopedOutput: URL?
 
     init(metadataService: AudibleMetadataSearching = AudibleMetadataService()) {
         self.metadataService = metadataService
-        restoreRule()
-        restoreBookmarks()
-        canUndoLastMove = manifest.hasManifest
     }
 
     deinit {
-        sourceAccessURL?.stopAccessingSecurityScopedResource()
-        outputAccessURL?.stopAccessingSecurityScopedResource()
-        for url in fileAccessURLs { url.stopAccessingSecurityScopedResource() }
+        securityScopedFolder?.stopAccessingSecurityScopedResource()
+        securityScopedOutput?.stopAccessingSecurityScopedResource()
     }
 
     // MARK: - Folder selection
 
-    func setSourceFolder(_ url: URL, fromBookmark: Bool = false) {
-        sourceAccessURL?.stopAccessingSecurityScopedResource()
-        if url.startAccessingSecurityScopedResource() {
-            sourceAccessURL = url
-        }
-        sourceFolder = url
-        if !fromBookmark { persistBookmark(for: url, key: Self.sourceBookmarkKey) }
-        Task { await scan() }
-    }
+    func loadFolder(_ url: URL) {
+        securityScopedFolder?.stopAccessingSecurityScopedResource()
+        let didStart = url.startAccessingSecurityScopedResource()
+        securityScopedFolder = didStart ? url : nil
 
-    func setOutputFolder(_ url: URL?, fromBookmark: Bool = false) {
-        outputAccessURL?.stopAccessingSecurityScopedResource()
-        outputAccessURL = nil
-        outputFolder = url
-        if let url {
-            if url.startAccessingSecurityScopedResource() {
-                outputAccessURL = url
-            }
-            if !fromBookmark { persistBookmark(for: url, key: Self.outputBookmarkKey) }
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.outputBookmarkKey)
-        }
-        refreshProposals()
-    }
-
-    /// Imports explicitly chosen audio files — appended to the current list
-    /// (deduplicated by path), never expanding to their parent folders.
-    func addFiles(_ urls: [URL]) {
-        let audio = urls.filter { FolderScanner.isSupportedAudioFile($0) }
-        guard !audio.isEmpty else { return }
-
-        for url in audio where url.startAccessingSecurityScopedResource() {
-            fileAccessURLs.append(url)
-        }
-
-        let existingPaths = Set(items.map { $0.url.path })
-        let newURLs = audio.filter { !existingPaths.contains($0.path) }
-        guard !newURLs.isEmpty else {
-            statusMessage = "Those files are already in the list"
-            return
-        }
-
-        let newItems = scanner.items(forFiles: newURLs)
-        items.append(contentsOf: newItems)
-        statusMessage = "\(items.count) file\(items.count == 1 ? "" : "s") in \(groupKeys.count) book group\(groupKeys.count == 1 ? "" : "s")"
-        Task { await readTags(urls: newURLs) }
-    }
-
-    /// Handles a drop of folders and/or audio files.
-    func handleDrop(urls: [URL]) {
-        let folders = urls.filter { $0.hasDirectoryPath || isDirectory($0) }
-        let audioFiles = urls.filter { FolderScanner.isSupportedAudioFile($0) }
-
-        if folders.count == 1 {
-            setSourceFolder(folders[0])
-        } else if folders.count > 1 {
-            if let ancestor = commonAncestor(of: folders) {
-                includeSubfolders = true
-                setSourceFolder(ancestor)
-            }
-        } else if !audioFiles.isEmpty {
-            // Bare files: import exactly these — do NOT expand to the folder.
-            addFiles(audioFiles)
-        }
-    }
-
-    private func isDirectory(_ url: URL) -> Bool {
-        (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-    }
-
-    func commonAncestor(of urls: [URL]) -> URL? {
-        guard var common = urls.first?.pathComponents else { return nil }
-        for url in urls.dropFirst() {
-            let components = url.pathComponents
-            var shared: [String] = []
-            for (a, b) in zip(common, components) where a == b {
-                shared.append(a)
-            }
-            common = shared
-        }
-        guard common.count > 1 else { return nil }
-        return URL(fileURLWithPath: common.joined(separator: "/").replacingOccurrences(of: "//", with: "/"))
-    }
-
-    // MARK: - Scanning
-
-    func scan() async {
-        guard let sourceFolder else { return }
-        isScanning = true
+        folderURL = url
+        items = []
+        folderNameOverrides = []
         statusMessage = nil
-        errorMessage = nil
-        let include = includeSubfolders
-        let scanned = await Task.detached(priority: .userInitiated) { [scanner] in
-            scanner.scan(root: sourceFolder, includeSubfolders: include)
-        }.value
-
-        items = scanned
-        isScanning = false
-        statusMessage = scanned.isEmpty
-            ? "No audio files found"
-            : "\(scanned.count) file\(scanned.count == 1 ? "" : "s") in \(groupKeys.count) book group\(groupKeys.count == 1 ? "" : "s")"
-
-        // Read embedded tags in the background; strong search signal.
-        Task { await readTags() }
-    }
-
-    private func readTags(urls: [URL]? = nil) async {
-        let targets = urls ?? items.map(\.url)
-        for url in targets {
-            guard let tags = await tagReader.readTags(from: url) else { continue }
-            if let index = items.firstIndex(where: { $0.url == url }) {
-                items[index].tags = tags
-                // Tags are a more reliable track source than filename heuristics
-                // — but only within multi-file groups where order matters.
-                if let track = tags.trackNumber,
-                   items.filter({ $0.groupKey == items[index].groupKey }).count > 1 {
-                    items[index].trackNumber = track
-                }
-            }
-        }
-    }
-
-    // MARK: - Matching
-
-    var groupKeys: [String] {
-        var seen = Set<String>()
-        return items.compactMap { seen.insert($0.groupKey).inserted ? $0.groupKey : nil }
-    }
-
-    func findMatches() async {
-        guard !items.isEmpty, !isMatching else { return }
-        isMatching = true
         matchProgress = 0
-        errorMessage = nil
-        statusMessage = nil
+        renameProgress = 0
 
-        let keys = groupKeys
-        let total = Double(keys.count)
-        let counter = Counter()
+        isScanning = true
+        defer { isScanning = false }
 
-        // Max 3 concurrent group searches per chunk; the throttler enforces
-        // the true global request gap underneath regardless of concurrency.
-        let chunks = stride(from: 0, to: keys.count, by: 3).map {
-            Array(keys[$0..<min($0 + 3, keys.count)])
-        }
-        for chunk in chunks {
-            await withTaskGroup(of: Void.self) { group in
-                for key in chunk {
-                    group.addTask { [weak self] in
-                        await self?.matchGroup(key: key)
-                        await counter.increment()
-                    }
-                }
-                await group.waitForAll()
-            }
-            let done = await counter.value
-            matchProgress = total > 0 ? Double(done) / total : 1
-        }
-
-        isMatching = false
-        matchProgress = 1
-        let matched = items.filter { $0.selectedMatch != nil }.count
-        statusMessage = "Matched \(matched) of \(items.count) files"
-        refreshProposals()
-    }
-
-    /// Re-runs matching for a single group (e.g. after a network error or
-    /// toggling folder-name search).
-    func rematchGroup(key: String) {
-        Task {
-            for index in items.indices where items[index].groupKey == key {
-                items[index].matchState = .pending
-            }
-            await matchGroup(key: key, bypassCache: true)
-            refreshProposals()
+        do {
+            let urls = try FolderScanner.scan(folder: url, recursive: recursiveScan)
+            items = urls.map { AudioFileItem(originalURL: $0) }
+            statusMessage = urls.isEmpty
+                ? "No supported audio files found in this folder."
+                : "\(urls.count) audio file(s) found. Click \u{201c}Find Matches\u{201d} to look them up."
+        } catch {
+            statusMessage = "Could not scan folder: \(error.localizedDescription)"
         }
     }
 
-    private func matchGroup(key: String, bypassCache: Bool = false) async {
-        guard let firstItem = items.first(where: { $0.groupKey == key }) else { return }
-        setState(.searching, forGroupKey: key)
-
-        let query = buildQuery(for: key)
-        lastQueries[key] = [query.author, query.title]
-            .compactMap { $0 }
-            .joined(separator: " ")
-        let cacheKey = "\(query.title)|\(query.author ?? "")"
-
-        var matches: [ScoredMatch]?
-        if !bypassCache {
-            matches = await cache.lookup(key: cacheKey)
-        }
-
-        if matches == nil {
-            do {
-                matches = try await searchAndScore(query: query, item: firstItem)
-                await cache.save(key: cacheKey, matches: matches ?? [])
-            } catch {
-                let message = (error as? AudibleServiceError)?.errorDescription
-                    ?? error.localizedDescription
-                setState(.error(message), forGroupKey: key)
-                if case AudibleServiceError.rateLimited = error {
-                    errorMessage = message
-                }
-                return
-            }
-        }
-
-        // Recompute indices AFTER the awaits — items may have changed.
-        applyMatches(matches ?? [], toGroupKey: key)
-    }
-
-    private func setState(_ state: MatchState, forGroupKey key: String) {
-        for i in items.indices where items[i].groupKey == key {
-            items[i].matchState = state
+    func loadOutputFolder(_ url: URL) {
+        securityScopedOutput?.stopAccessingSecurityScopedResource()
+        let didStart = url.startAccessingSecurityScopedResource()
+        securityScopedOutput = didStart ? url : nil
+        outputFolderURL = url
+        for index in items.indices {
+            items[index].proposedFilename = RenameEngine.proposedFilename(for: items[index], rule: rule)
         }
     }
 
-    private func searchAndScore(query: MatchScorer.Query, item: AudioFileItem) async throws -> [ScoredMatch] {
-        var keywordSets: [String] = []
-
-        // Primary convention.
-        if let author = query.author {
-            keywordSets.append("\(author) \(query.title)")
-        }
-        keywordSets.append(query.title)
-
-        // Swapped convention ("Title - Author" filenames).
-        if let swapped = item.parsed.swappedInterpretation {
-            keywordSets.append("\(swapped.author ?? "") \(swapped.title)".trimmingCharacters(in: .whitespaces))
-        }
-
-        var best: [ScoredMatch] = []
-        for keywords in deduplicate(keywordSets) {
-            let products = try await metadataService.search(keywords: keywords)
-            let scored = scorer.score(products: products, against: query)
-            // Merge, keeping the best score per ASIN.
-            for match in scored {
-                if let existing = best.firstIndex(where: { $0.product.asin == match.product.asin }) {
-                    if match.score > best[existing].score { best[existing] = match }
-                } else {
-                    best.append(match)
-                }
-            }
-            // If we already have a very strong hit, skip remaining conventions.
-            if best.contains(where: { $0.score >= 0.9 }) { break }
-        }
-        return best.sorted { $0.score > $1.score }
-    }
-
-    /// Removes empty and duplicate keyword sets while preserving order.
-    private func deduplicate(_ strings: [String]) -> [String] {
-        var seen = Set<String>()
-        return strings.filter { !$0.isEmpty && seen.insert($0).inserted }
-    }
-
-    private func buildQuery(for key: String) -> MatchScorer.Query {
-        let group = items.filter { $0.groupKey == key }
-        guard let first = group.first else {
-            return MatchScorer.Query(title: "")
-        }
-
-        let totalDuration = group.compactMap { $0.tags?.durationSeconds }.reduce(0, +)
-        let duration: Double? = totalDuration > 0 && group.allSatisfy({ $0.tags?.durationSeconds != nil })
-            ? totalDuration : nil
-
-        let forceFolderName = folderNameOverrides.contains(first.folderPath)
-
-        // Tags first: album + artist beat filename parsing when present.
-        if !forceFolderName,
-           let album = first.tags?.album, !album.isEmpty {
-            return MatchScorer.Query(
-                title: album,
-                author: first.tags?.artist,
-                seriesNumber: first.parsed.seriesNumber,
-                totalDurationSeconds: duration
-            )
-        }
-
-        if group.count > 1 || forceFolderName {
-            // Multi-file groups: parent folder name ONLY — chapter filenames
-            // are noise, not book titles.
-            let parsed = FilenameParser.parseFolderName(first.folderName)
-            return MatchScorer.Query(
-                title: parsed.title,
-                author: parsed.author,
-                seriesNumber: parsed.seriesNumber,
-                totalDurationSeconds: duration
-            )
-        }
-
-        // Single-file books: filename + immediate parent folder as combined
-        // signals (one level up only).
-        let parsed = first.parsed
-        let folderParsed = FilenameParser.parseFolderName(first.folderName)
-        return MatchScorer.Query(
-            title: parsed.title,
-            author: parsed.author ?? folderParsed.author,
-            seriesNumber: parsed.seriesNumber ?? folderParsed.seriesNumber,
-            totalDurationSeconds: duration
-        )
-    }
-
-    private func applyMatches(_ matches: [ScoredMatch], toGroupKey key: String) {
-        let indices = items.indices.filter { items[$0].groupKey == key }
-        for i in indices {
-            items[i].candidates = matches
-            if let top = matches.first {
-                if top.score >= MatchScorer.autoAcceptThreshold {
-                    items[i].matchState = .matched(confidence: top.score)
-                    items[i].selectedMatch = top
-                    items[i].isIncluded = true
-                } else {
-                    items[i].matchState = .review(confidence: top.score)
-                    items[i].selectedMatch = top
-                    items[i].isIncluded = false
-                }
-            } else {
-                items[i].matchState = .noMatch
-                items[i].selectedMatch = nil
-                items[i].isIncluded = false
-            }
+    func clearOutputFolder() {
+        securityScopedOutput?.stopAccessingSecurityScopedResource()
+        securityScopedOutput = nil
+        outputFolderURL = nil
+        for index in items.indices {
+            items[index].proposedFilename = RenameEngine.proposedFilename(for: items[index], rule: rule)
         }
     }
 
-    // MARK: - Manual match controls
+    // MARK: - Folder name override toggle
 
-    func selectMatch(_ match: ScoredMatch, for itemID: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
-        items[index].selectedMatch = match
-        items[index].matchState = match.score >= MatchScorer.autoAcceptThreshold
-            ? .matched(confidence: match.score)
-            : .review(confidence: match.score)
-        items[index].isIncluded = true
-        refreshProposals()
-    }
-
-    /// One click fixes 50 chapter files: applies a match to ALL files
-    /// sharing the folder path.
-    func applyMatchToFolder(_ match: ScoredMatch, for itemID: UUID) {
-        guard let item = items.first(where: { $0.id == itemID }) else { return }
-        for index in items.indices where items[index].folderPath == item.folderPath {
-            items[index].selectedMatch = match
-            items[index].matchState = .matched(confidence: match.score)
-            items[index].isIncluded = true
-        }
-        refreshProposals()
-    }
-
-    /// Manual search typed by the user, applied to one group.
-    func manualSearch(keywords: String, groupKey: String) {
-        Task {
-            lastQueries[groupKey] = keywords
-            setState(.searching, forGroupKey: groupKey)
-
-            // Pasted ASIN / Audible URL → exact lookup.
-            if let asin = ASINExtractor.extract(from: keywords) {
-                do {
-                    if let product = try await metadataService.lookup(asin: asin) {
-                        let match = ScoredMatch(product: product, score: 1.0)
-                        applyMatches([match], toGroupKey: groupKey)
-                        refreshProposals()
-                        return
-                    }
-                } catch { /* fall through to keyword search */ }
-            }
-
-            do {
-                let products = try await metadataService.search(keywords: keywords)
-                let query = buildQuery(for: groupKey)
-                var scored = scorer.score(products: products, against: query)
-                if scored.isEmpty {
-                    // User insisted on this search — show raw results for
-                    // manual pick even if scores are weak.
-                    scored = products.map { ScoredMatch(product: $0, score: 0.5) }
-                }
-                applyMatches(scored, toGroupKey: groupKey)
-            } catch {
-                let message = (error as? AudibleServiceError)?.errorDescription ?? error.localizedDescription
-                setState(.error(message), forGroupKey: groupKey)
-            }
-            refreshProposals()
-        }
-    }
-
-    func toggleFolderNameSearch(folderPath: String) {
+    func toggleFolderNameOverride(for folderPath: String) async {
         if folderNameOverrides.contains(folderPath) {
             folderNameOverrides.remove(folderPath)
         } else {
             folderNameOverrides.insert(folderPath)
         }
-        // Re-run immediately for affected groups.
-        let keys = Set(items.filter { $0.folderPath == folderPath }.map(\.groupKey))
-        for key in keys { rematchGroup(key: key) }
-    }
 
-    // MARK: - Inclusion toggles
-
-    func toggleIncluded(itemID: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
-        items[index].isIncluded.toggle()
-    }
-
-    /// nil = mixed, true = all included, false = none.
-    func folderIncludedState(folderPath: String) -> Bool? {
-        let matchable = items.filter { $0.folderPath == folderPath && $0.selectedMatch != nil }
-        guard !matchable.isEmpty else { return false }
-        let included = matchable.filter(\.isIncluded).count
-        if included == 0 { return false }
-        if included == matchable.count { return true }
-        return nil
-    }
-
-    func toggleFolderIncluded(folderPath: String) {
-        let target = folderIncludedState(folderPath: folderPath) != true
-        for index in items.indices
-        where items[index].folderPath == folderPath && items[index].selectedMatch != nil {
-            items[index].isIncluded = target
+        let affectedIndices = items.indices.filter {
+            items[$0].originalURL.deletingLastPathComponent().path == folderPath
         }
-    }
+        guard !affectedIndices.isEmpty else { return }
 
-    func toggleCollapsed(folderPath: String) {
-        if collapsedFolders.contains(folderPath) {
-            collapsedFolders.remove(folderPath)
-        } else {
-            collapsedFolders.insert(folderPath)
-        }
-    }
+        let groups = buildGroups(from: Array(affectedIndices))
+        await MainActor.run { isMatching = true }
+        defer { Task { @MainActor in self.isMatching = false } }
 
-    // MARK: - Proposals
-
-    func refreshProposals() {
-        for index in items.indices {
-            guard let match = items[index].selectedMatch else {
-                items[index].proposedRelativePath = nil
-                continue
-            }
-            items[index].proposedRelativePath = renameEngine.proposedRelativePath(
-                match: match,
-                trackNumber: items[index].trackNumber,
-                fileExtension: items[index].fileExtension,
-                rule: rule
-            )
-        }
-
-        // Safety net: if several files in the SAME source folder rendered
-        // identical proposed paths, the grouper missed a numbering scheme.
-        // Run the track resolver over just those files — it detects an
-        // increasing sequence in the filenames, or falls back to filename
-        // order — then re-render with the recovered track numbers.
-        var byProposal: [String: [Int]] = [:]
-        for index in items.indices {
-            guard let path = items[index].proposedRelativePath else { continue }
-            byProposal[items[index].folderPath + "|" + path, default: []].append(index)
-        }
-        for (_, indices) in byProposal where indices.count > 1 {
-            let sorted = indices.sorted {
-                items[$0].filename.localizedStandardCompare(items[$1].filename) == .orderedAscending
-            }
-            let resolved = TrackNumberResolver.resolve(sortedURLs: sorted.map { items[$0].url })
-            for i in sorted {
-                items[i].trackNumber = resolved[items[i].url]
-                if let match = items[i].selectedMatch {
-                    items[i].proposedRelativePath = renameEngine.proposedRelativePath(
-                        match: match,
-                        trackNumber: items[i].trackNumber,
-                        fileExtension: items[i].fileExtension,
-                        rule: rule
-                    )
+        await withTaskGroup(of: Void.self) { group in
+            for indices in groups {
+                group.addTask { [weak self] in
+                    await self?.matchGroup(indices: indices)
                 }
             }
         }
     }
 
-    // MARK: - Rename / move
+    // MARK: - Apply match to entire folder
 
-    var includedCount: Int {
-        items.filter { $0.isIncluded && $0.proposedRelativePath != nil }.count
+    /// Applies a chosen match to every file in the same folder,
+    /// so the user doesn't have to correct 50 files one by one.
+    func applyMatchToFolder(_ match: AudibleMatch, for itemID: UUID) {
+        guard let clickedIndex = items.firstIndex(where: { $0.id == itemID }) else { return }
+        let folderPath = items[clickedIndex].originalURL.deletingLastPathComponent().path
+
+        for index in items.indices {
+            guard items[index].originalURL.deletingLastPathComponent().path == folderPath else { continue }
+            items[index].selectedMatch    = match
+            items[index].status           = .matched(confidence: 1.0)
+            items[index].includeInBatch   = true
+            items[index].proposedFilename = RenameEngine.proposedFilename(for: items[index], rule: rule)
+        }
     }
 
-    func performRename() async {
-        guard !isRenaming, !isMatching else { return }
-        refreshProposals()
+    // MARK: - Grouping
 
-        let targets = items.indices.filter {
-            items[$0].isIncluded && items[$0].proposedRelativePath != nil
+    private func buildGroups(from indices: [Int]) -> [[Int]] {
+        let byFolder = Dictionary(grouping: indices) { index in
+            items[index].originalURL.deletingLastPathComponent().path
         }
-        guard !targets.isEmpty else { return }
 
-        isRenaming = true
-        renameProgress = 0
-        errorMessage = nil
-        let isDryRun = dryRun
-        var records: [MoveRecord] = []
-        var takenLowercased = Set<String>()
-        var moved = 0, failed = 0
-        var companionsHandled = Set<String>()
+        var groups: [[Int]] = []
+        for (_, folderIndices) in byFolder {
+            if folderIndices.count == 1 {
+                groups.append(folderIndices)
+                continue
+            }
+            let byPrefix = Dictionary(grouping: folderIndices) { index in
+                filenamePrefix(for: items[index].originalURL)
+            }
+            for (_, prefixIndices) in byPrefix {
+                groups.append(prefixIndices)
+            }
+        }
+        return groups
+    }
 
-        for (progressIndex, index) in targets.enumerated() {
-            currentlyProcessing = items[index].filename
+    private func filenamePrefix(for url: URL) -> String {
+        var name = url.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
 
-            let outcome = renameEngine.apply(
-                fileURL: items[index].url,
-                relativePath: items[index].proposedRelativePath!,
-                outputFolder: outputFolder,
-                dryRun: isDryRun,
-                copyInsteadOfMove: copyInsteadOfMove,
-                takenLowercased: &takenLowercased
-            )
-            items[index].renameResult = outcome.result
-            if let record = outcome.record { records.append(record) }
+        // Strip trailing chapter/track/number patterns.
+        let trailingPatterns = [
+            #"\s*(chapter|part|track|disc|disk|episode)\s*\d+\s*$"#,
+            #"\s*[-–]\s*\d+\s*$"#,
+            #"\s+\d+\s*$"#,
+        ]
+        for pattern in trailingPatterns {
+            if let range = name.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
+                name.removeSubrange(range)
+            }
+        }
 
-            switch outcome.result {
-            case .moved: moved += 1
-            case .failed: failed += 1
-            default: break
+        // Strip middle track-number segments: "Title - 001 - Chapter Name"
+        // → "Title". Covers the common pattern where a zero-padded track
+        // number sits between the book title and chapter title.
+        if let range = name.range(of: #"\s*-\s*0*\d{1,4}\s*-.*$"#, options: .regularExpression) {
+            name.removeSubrange(range)
+        }
+
+        return name.trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: - Search signal helpers
+
+    private func searchCandidates(for url: URL, forceFolder: Bool) -> [ParsedFilename] {
+        let parentFolder = url.deletingLastPathComponent()
+        let rootFolder   = folderURL ?? parentFolder
+        let folderName   = parentFolder.path == rootFolder.path
+            ? url.deletingPathExtension().lastPathComponent
+            : parentFolder.lastPathComponent
+        let fakeURL = URL(fileURLWithPath: "/tmp/\(folderName).m4b")
+        let folderCandidates = [
+            FilenameParser.parse(fakeURL, assumeTitleFirst: false),
+            FilenameParser.parse(fakeURL, assumeTitleFirst: true),
+        ]
+
+        if forceFolder { return folderCandidates }
+
+        var candidates = [
+            FilenameParser.parse(url, assumeTitleFirst: false),
+            FilenameParser.parse(url, assumeTitleFirst: true),
+        ]
+        if parentFolder.path != rootFolder.path {
+            candidates += folderCandidates
+        }
+        return candidates
+    }
+
+    // MARK: - Matching
+
+    func matchAll() async {
+        guard !items.isEmpty else { return }
+        await MainActor.run {
+            isMatching    = true
+            matchProgress = 0
+            statusMessage = "Looking up metadata\u{2026}"
+        }
+        defer { Task { @MainActor in self.isMatching = false } }
+
+        let groups = buildGroups(from: Array(items.indices))
+        let total  = Double(groups.count)
+        let counter = Counter()
+
+        await withTaskGroup(of: Void.self) { group in
+            for indices in groups {
+                group.addTask { [weak self] in
+                    await self?.matchGroup(indices: indices)
+                    let done = await counter.increment()
+                    await MainActor.run {
+                        self?.matchProgress = Double(done) / total
+                    }
+                }
+            }
+        }
+
+        let matchedCount = items.filter {
+            if case .matched = $0.status { return true }
+            return false
+        }.count
+        await MainActor.run {
+            matchProgress = 1.0
+            statusMessage = "Matched \(matchedCount) of \(items.count) file(s)."
+        }
+    }
+
+    private func matchGroup(indices: [Int]) async {
+        guard !indices.isEmpty else { return }
+
+        let sorted = indices.sorted {
+            items[$0].originalURL.lastPathComponent
+                .localizedStandardCompare(items[$1].originalURL.lastPathComponent) == .orderedAscending
+        }
+
+        let isMultiFile = sorted.count > 1
+        let folderPath  = items[sorted[0]].originalURL.deletingLastPathComponent().path
+        let forceFolder = folderNameOverrides.contains(folderPath)
+
+        // ── Resolve track numbers using sequence consistency check ──
+        // For multi-file groups: find the number position in the filenames
+        // that forms a complete unbroken sequence across all files. This
+        // correctly identifies track numbers even when chapter numbers,
+        // series numbers, or years are also present in the filename.
+        // For single files: use whatever the parser found, or nil.
+        var trackNumbers: [Int: Int?] = [:]
+
+        if isMultiFile {
+            let sortedURLs = sorted.map { items[$0].originalURL }
+            let resolved   = TrackNumberResolver.resolve(sortedURLs: sortedURLs)
+            for i in sorted {
+                trackNumbers[i] = resolved[items[i].originalURL]
+            }
+        } else {
+            let parsed = FilenameParser.parse(items[sorted[0]].originalURL, assumeTitleFirst: false)
+            trackNumbers[sorted[0]] = parsed.trackNumber
+        }
+
+        await MainActor.run {
+            for i in sorted { items[i].status = .searching }
+        }
+
+        let representativeURL = items[sorted[0]].originalURL
+        let candidates: [ParsedFilename] = isMultiFile && !forceFolder
+            ? searchCandidates(for: representativeURL, forceFolder: true)
+            : searchCandidates(for: representativeURL, forceFolder: forceFolder)
+
+        do {
+            var seen = Set<String>()
+            var allResults: [AudibleMatch] = []
+
+            for parsed in candidates {
+                let cacheKey = parsed.searchQuery.lowercased()
+                guard !cacheKey.isEmpty else { continue }
+                let results: [AudibleMatch]
+                if let cached = await cache.cachedResult(for: cacheKey) {
+                    results = cached
+                } else {
+                    results = try await metadataService.search(parsed: parsed)
+                    await cache.store(results, for: cacheKey)
+                }
+                for match in results where seen.insert(match.asin).inserted {
+                    allResults.append(match)
+                }
             }
 
-            // Companion files: move alongside the first file of each source
-            // folder that had a real (non-dry-run) move to an output folder.
-            if !isDryRun, moveCompanionFiles, outputFolder != nil,
-               case .moved(let destinationPath) = outcome.result,
-               !companionsHandled.contains(items[index].folderPath) {
-                companionsHandled.insert(items[index].folderPath)
-                let destinationFolder = URL(fileURLWithPath: destinationPath).deletingLastPathComponent()
-                for companion in scanner.companionFiles(in: URL(fileURLWithPath: items[index].folderPath)) {
-                    let target = destinationFolder.appendingPathComponent(companion.lastPathComponent)
-                    if !FileManager.default.fileExists(atPath: target.path) {
-                        if copyInsteadOfMove {
-                            try? FileManager.default.copyItem(at: companion, to: target)
-                        } else if (try? FileManager.default.moveItem(at: companion, to: target)) != nil {
-                            records.append(MoveRecord(source: companion.path, destination: target.path))
-                        }
+            let scored = allResults
+                .map { match -> (match: AudibleMatch, score: Double) in
+                    let best = candidates.map {
+                        MatchScorer.score(parsed: $0, candidate: match)
+                    }.max() ?? 0
+                    return (match, best)
+                }
+                .sorted { $0.score > $1.score }
+
+            let status      = MatchScorer.status(forTopScore: scored.first?.score)
+            let bestMatch   = scored.first?.match
+            let matchCandidates = scored.map(\.match)
+
+            await MainActor.run {
+                for i in sorted {
+                    var parsed = FilenameParser.parse(items[i].originalURL, assumeTitleFirst: false)
+                    parsed.trackNumber       = trackNumbers[i] ?? nil
+                    items[i].parsed          = parsed
+                    items[i].candidates      = matchCandidates
+                    items[i].status          = status
+                    items[i].selectedMatch   = bestMatch
+                    items[i].includeInBatch  = bestMatch != nil
+                    items[i].proposedFilename = RenameEngine.proposedFilename(for: items[i], rule: rule)
+                }
+            }
+
+        } catch {
+            await MainActor.run {
+                for i in sorted {
+                    var parsed = FilenameParser.parse(items[i].originalURL, assumeTitleFirst: false)
+                    parsed.trackNumber  = trackNumbers[i] ?? nil
+                    items[i].parsed     = parsed
+                    items[i].status     = .error(error.localizedDescription)
+                    items[i].includeInBatch = false
+                }
+            }
+        }
+    }
+
+    // MARK: - Manual overrides
+
+    func selectMatch(_ match: AudibleMatch, for itemID: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        items[index].selectedMatch    = match
+        items[index].status           = .matched(confidence: 1.0)
+        items[index].includeInBatch   = true
+        items[index].proposedFilename = RenameEngine.proposedFilename(for: items[index], rule: rule)
+    }
+
+    func setIncluded(_ included: Bool, for itemID: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        items[index].includeInBatch = included
+    }
+
+    /// Toggles the included state for every file in a folder.
+    /// If any file is currently excluded, includes all; if all included, excludes all.
+    func toggleFolderIncluded(folderPath: String) {
+        let indices = items.indices.filter {
+            items[$0].originalURL.deletingLastPathComponent().path == folderPath
+            && items[$0].selectedMatch != nil
+        }
+        let allIncluded = indices.allSatisfy { items[$0].includeInBatch }
+        for i in indices {
+            items[i].includeInBatch = !allIncluded
+        }
+    }
+
+    /// Returns true if all matchable files in the folder are included,
+    /// false if none, nil if mixed.
+    func folderIncludedState(folderPath: String) -> Bool? {
+        let indices = items.indices.filter {
+            items[$0].originalURL.deletingLastPathComponent().path == folderPath
+            && items[$0].selectedMatch != nil
+        }
+        guard !indices.isEmpty else { return nil }
+        let included = indices.filter { items[$0].includeInBatch }.count
+        if included == indices.count { return true }
+        if included == 0 { return false }
+        return nil
+    }
+
+    // MARK: - Clearing the list
+
+    /// Removing items shifts the indices that in-flight matching and moving
+    /// rely on, so list edits are blocked while either is running.
+    var canEditList: Bool { !isMatching && !isRenaming }
+
+    /// Number of files that have already been moved (safe to clear).
+    var completedCount: Int {
+        items.filter { if case .renamed = $0.renameResult { return true }; return false }.count
+    }
+
+    /// Removes one file from the list. The file on disk is not touched.
+    func removeItem(_ itemID: UUID) {
+        guard canEditList else { return }
+        items.removeAll { $0.id == itemID }
+        pruneFolderState()
+    }
+
+    /// Removes every file in a folder from the list. Nothing on disk changes.
+    func removeFolder(_ folderPath: String) {
+        guard canEditList else { return }
+        items.removeAll { $0.originalURL.deletingLastPathComponent().path == folderPath }
+        pruneFolderState()
+    }
+
+    /// Removes files that have already been moved, leaving the rest in place.
+    func clearCompleted() {
+        guard canEditList else { return }
+        let removed = completedCount
+        items.removeAll { if case .renamed = $0.renameResult { return true }; return false }
+        pruneFolderState()
+        if !items.isEmpty {
+            statusMessage = "Cleared \(removed) completed file(s)."
+        }
+    }
+
+    /// Empties the list and releases the source folder. The output folder and
+    /// rename rule are kept so the next batch can start straight away.
+    func clearAll() {
+        guard canEditList else { return }
+        items = []
+        folderNameOverrides = []
+        folderURL = nil
+        securityScopedFolder?.stopAccessingSecurityScopedResource()
+        securityScopedFolder = nil
+        matchProgress = 0
+        renameProgress = 0
+        currentlyProcessing = nil
+        statusMessage = nil
+    }
+
+    /// Drops per-folder state for folders that no longer have any files.
+    private func pruneFolderState() {
+        let livePaths = Set(items.map { $0.originalURL.deletingLastPathComponent().path })
+        folderNameOverrides = folderNameOverrides.intersection(livePaths)
+        if items.isEmpty {
+            statusMessage = "List cleared. Drop a folder or choose a source folder to start again."
+        }
+    }
+
+    func updateRule(_ newRule: RenameRule) {
+        rule = newRule
+        for index in items.indices {
+            items[index].proposedFilename = RenameEngine.proposedFilename(for: items[index], rule: rule)
+        }
+    }
+
+    // MARK: - Renaming
+
+    func performRename() async {
+        isRenaming          = true
+        renameProgress      = 0
+        currentlyProcessing = nil
+        defer {
+            isRenaming          = false
+            currentlyProcessing = nil
+        }
+
+        let eligible = items.filter { $0.includeInBatch && $0.proposedFilename != nil }
+        let total    = Double(max(eligible.count, 1))
+        var done     = 0
+        var usedNames = Set<String>()
+        let fm        = FileManager.default
+        let isDry     = dryRun
+        let outputURL = outputFolderURL
+
+        for index in items.indices {
+            guard items[index].includeInBatch,
+                  let proposed = items[index].proposedFilename else { continue }
+
+            // Show the current file in the footer so the user knows
+            // the app is working and hasn't frozen.
+            currentlyProcessing = items[index].originalFilename
+
+            let destinationRoot = outputURL ?? items[index].originalURL.deletingLastPathComponent()
+            let destination     = destinationRoot.appendingPathComponent(proposed)
+
+            if destination.path == items[index].originalURL.path {
+                items[index].renameResult = .skipped(reason: "Already in the right place")
+                usedNames.insert(proposed)
+            } else {
+                let uniqueName       = uniquePath(proposed, in: destinationRoot, alreadyUsed: usedNames, fm: fm)
+                let finalDestination = destinationRoot.appendingPathComponent(uniqueName)
+                usedNames.insert(uniqueName)
+
+                if isDry {
+                    items[index].renameResult = .dryRun(to: finalDestination.path)
+                } else {
+                    // Yield to the run loop between files so the UI can
+                    // update the progress bar and filename log.
+                    await Task.yield()
+                    do {
+                        try fm.createDirectory(
+                            at: finalDestination.deletingLastPathComponent(),
+                            withIntermediateDirectories: true
+                        )
+                        try fm.moveItem(at: items[index].originalURL, to: finalDestination)
+                        items[index].renameResult = .renamed(to: finalDestination.path)
+                    } catch {
+                        items[index].renameResult = .failed(reason: error.localizedDescription)
                     }
                 }
             }
 
-            renameProgress = Double(progressIndex + 1) / Double(targets.count)
-            await Task.yield() // let the UI update the progress bar
+            done += 1
+            renameProgress = Double(done) / total
         }
 
-        if !isDryRun {
-            if !records.isEmpty {
-                manifest.save(records)
-                canUndoLastMove = true
-            }
-            if cleanupEmptyFolders, !copyInsteadOfMove, let sourceFolder {
-                let removed = renameEngine.removeEmptyDirectories(under: sourceFolder)
-                if !removed.isEmpty {
-                    statusMessage = "Moved \(moved), failed \(failed) — cleaned \(removed.count) empty folder\(removed.count == 1 ? "" : "s")"
-                }
-            }
-        }
+        let renamed    = items.filter { if case .renamed  = $0.renameResult { return true }; return false }.count
+        let plannedDry = items.filter { if case .dryRun   = $0.renameResult { return true }; return false }.count
+        let failed     = items.filter { if case .failed   = $0.renameResult { return true }; return false }.count
 
-        currentlyProcessing = nil
-        isRenaming = false
-        renameProgress = 1
-        if statusMessage == nil || isDryRun {
-            statusMessage = isDryRun
-                ? "Preview complete — \(targets.count) file\(targets.count == 1 ? "" : "s") would be processed"
-                : "Moved \(moved) file\(moved == 1 ? "" : "s")\(failed > 0 ? ", \(failed) failed" : "")"
+        renameProgress = 1.0
+
+        if isDry {
+            statusMessage = "Dry run complete: \(plannedDry) file(s) would be moved."
+        } else {
+            let dest = outputURL?.path ?? "in place"
+            statusMessage = failed == 0
+                ? "Moved \(renamed) file(s) to \(dest)."
+                : "Moved \(renamed) file(s), \(failed) failed \u{2014} see details below."
         }
     }
 
-    func undoLastMove() async {
-        let records = manifest.load()
-        guard !records.isEmpty else { return }
-        isRenaming = true
-        statusMessage = "Undoing last move…"
-        let result = await Task.detached(priority: .userInitiated) { [renameEngine] in
-            renameEngine.undo(records: records)
-        }.value
-        manifest.clear()
-        canUndoLastMove = false
-        isRenaming = false
-        statusMessage = "Restored \(result.restored) file\(result.restored == 1 ? "" : "s")\(result.failed > 0 ? " — \(result.failed) could not be restored" : "")"
-        await scan()
-    }
+    private func uniquePath(_ relative: String, in root: URL, alreadyUsed: Set<String>, fm: FileManager) -> String {
+        let ext     = (relative as NSString).pathExtension
+        let base    = (relative as NSString).deletingPathExtension
+        let extPart = ext.isEmpty ? "" : ".\(ext)"
 
-    // MARK: - Persistence
-
-    private func persistRule() {
-        if let data = try? JSONEncoder().encode(rule) {
-            UserDefaults.standard.set(data, forKey: Self.ruleDefaultsKey)
+        var candidate = relative
+        var counter   = 2
+        while alreadyUsed.contains(candidate)
+            || fm.fileExists(atPath: root.appendingPathComponent(candidate).path) {
+            candidate = "\(base) (\(counter))\(extPart)"
+            counter  += 1
         }
-        refreshProposals()
-    }
-
-    private func restoreRule() {
-        if let data = UserDefaults.standard.data(forKey: Self.ruleDefaultsKey),
-           let restored = try? JSONDecoder().decode(RenameRule.self, from: data) {
-            rule = restored
-        }
-    }
-
-    private func persistBookmark(for url: URL, key: String) {
-        if let data = try? url.bookmarkData(
-            options: .withSecurityScope,
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        ) {
-            UserDefaults.standard.set(data, forKey: key)
-        }
-    }
-
-    private func restoreBookmarks() {
-        if let url = resolveBookmark(key: Self.outputBookmarkKey) {
-            setOutputFolder(url, fromBookmark: true)
-        }
-        // Source folder intentionally not auto-restored to a scan on launch;
-        // resolve it so the picker starts in the right place if wanted.
-        if let url = resolveBookmark(key: Self.sourceBookmarkKey) {
-            _ = url // available for future "reopen last folder" feature
-        }
-    }
-
-    private func resolveBookmark(key: String) -> URL? {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        var stale = false
-        guard let url = try? URL(
-            resolvingBookmarkData: data,
-            options: .withSecurityScope,
-            relativeTo: nil,
-            bookmarkDataIsStale: &stale
-        ), !stale else {
-            UserDefaults.standard.removeObject(forKey: key)
-            return nil
-        }
-        return url
+        return candidate
     }
 }
 
-/// Thread-safe progress counter across concurrent tasks.
-actor Counter {
-    private(set) var value = 0
-    func increment() { value += 1 }
+/// Thread-safe counter for tracking concurrent group completions.
+private actor Counter {
+    private var value = 0
+    func increment() -> Int {
+        value += 1
+        return value
+    }
 }

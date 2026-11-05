@@ -1,87 +1,78 @@
 import Foundation
 
-/// Codable snapshot of a scored match for disk persistence.
-nonisolated struct CodableMatch: Codable {
-    let product: AudibleProduct
-    let score: Double
-
-    init(_ match: ScoredMatch) {
-        product = match.product
-        score = match.score
-    }
-
-    var scoredMatch: ScoredMatch { ScoredMatch(product: product, score: score) }
-}
-
-/// Disk half of the two-level cache. Flat JSON: `[String: [CodableMatch]]`
-/// at `~/Library/Caches/AudiobookRenamer/metadata_cache.json`.
+/// Persists Audible search results to disk so the same book is never
+/// looked up twice across sessions.
 ///
-/// `@unchecked Sendable`: all I/O and dictionary access is serialized on a
-/// private DispatchQueue.
-nonisolated final class MetadataDiskCache: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "MetadataDiskCache.io")
+/// All file I/O is dispatched to a background queue so it never blocks
+/// the main actor or triggers Swift concurrency warnings.
+final class MetadataDiskCache: @unchecked Sendable {
+
+    private let cacheURL: URL
+    private let queue = DispatchQueue(label: "com.audiobookrenamer.diskcache", qos: .utility)
     private var store: [String: [CodableMatch]] = [:]
-    private let fileURL: URL
 
     init() {
-        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AudiobookRenamer", isDirectory: true)
-        try? FileManager.default.createDirectory(at: cachesDir, withIntermediateDirectories: true)
-        fileURL = cachesDir.appendingPathComponent("metadata_cache.json")
-
-        // Load on init — synchronous, happens once.
-        if let data = try? Data(contentsOf: fileURL),
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let dir = caches.appendingPathComponent("AudiobookRenamer", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        cacheURL = dir.appendingPathComponent("metadata_cache.json")
+        // Load synchronously once at init time — happens on whatever thread
+        // constructs this object (the MetadataCache actor's executor).
+        if let data = try? Data(contentsOf: cacheURL),
            let decoded = try? JSONDecoder().decode([String: [CodableMatch]].self, from: data) {
             store = decoded
         }
     }
 
-    func lookup(key: String) -> [ScoredMatch]? {
-        queue.sync { store[key]?.map(\.scoredMatch) }
+    func load(for key: String) -> [AudibleMatch]? {
+        store[key].map { $0.map(\.match) }
     }
 
-    func save(key: String, matches: [ScoredMatch]) {
-        // Fire-and-forget on the background queue.
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.store[key] = matches.map(CodableMatch.init)
-            if let data = try? JSONEncoder().encode(self.store) {
-                try? data.write(to: self.fileURL, options: .atomic)
-            }
-        }
-    }
-
-    func clear() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.store.removeAll()
-            try? FileManager.default.removeItem(at: self.fileURL)
+    func save(_ results: [AudibleMatch], for key: String) {
+        store[key] = results.map(CodableMatch.init)
+        // Write to disk in the background — fire and forget.
+        let snapshot = store
+        let url = cacheURL
+        queue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
         }
     }
 }
 
-/// In-memory half of the cache (this session), plus the gateway that
-/// consults disk before allowing a network search.
-actor MetadataCache {
-    private var memory: [String: [ScoredMatch]] = [:]
-    private let disk = MetadataDiskCache()
+// MARK: - Codable bridge
 
-    func lookup(key: String) -> [ScoredMatch]? {
-        if let hit = memory[key] { return hit }
-        if let hit = disk.lookup(key: key) {
-            memory[key] = hit
-            return hit
-        }
-        return nil
+private struct CodableMatch: Codable {
+    let asin: String
+    let title: String
+    let subtitle: String?
+    let authors: [String]
+    let narrators: [String]
+    let seriesTitle: String?
+    let seriesSequence: String?
+    let releaseYear: String?
+
+    init(_ match: AudibleMatch) {
+        asin           = match.asin
+        title          = match.title
+        subtitle       = match.subtitle
+        authors        = match.authors
+        narrators      = match.narrators
+        seriesTitle    = match.seriesTitle
+        seriesSequence = match.seriesSequence
+        releaseYear    = match.releaseYear
     }
 
-    func save(key: String, matches: [ScoredMatch]) {
-        memory[key] = matches
-        disk.save(key: key, matches: matches)
-    }
-
-    func clearAll() {
-        memory.removeAll()
-        disk.clear()
+    var match: AudibleMatch {
+        AudibleMatch(
+            asin:           asin,
+            title:          title,
+            subtitle:       subtitle,
+            authors:        authors,
+            narrators:      narrators,
+            seriesTitle:    seriesTitle,
+            seriesSequence: seriesSequence,
+            releaseYear:    releaseYear
+        )
     }
 }

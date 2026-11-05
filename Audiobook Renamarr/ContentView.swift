@@ -1,304 +1,339 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Single `.fileImporter` target selector — avoids SwiftUI's two-importer
-/// conflict bug.
-enum FolderPickerTarget: Identifiable {
-    case source
-    case output
-    var id: Int { self == .source ? 0 : 1 }
+enum FolderPickerTarget {
+    case source, output
 }
 
 struct ContentView: View {
-    @EnvironmentObject var viewModel: LibraryViewModel
+    @StateObject private var viewModel = LibraryViewModel()
+    @State private var isPickingFolder = false
     @State private var pickerTarget: FolderPickerTarget = .source
-    @State private var showPicker = false
-    @State private var showRuleEditor = false
-    @State private var isDropTargeted = false
+    @State private var isEditingRule = false
+    @State private var isDroppingSource = false
+    @State private var confirmClearAll = false
 
     var body: some View {
         VStack(spacing: 0) {
-            toolbar
+            header
             Divider()
-            progressArea
-            content
+            if viewModel.items.isEmpty {
+                emptyState
+            } else {
+                FileListView(viewModel: viewModel)
+            }
             Divider()
-            bottomBar
+            footer
         }
-        .overlay(dropOverlay)
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+        .frame(minWidth: 900, minHeight: 580)
+        .fileImporter(
+            isPresented: $isPickingFolder,
+            allowedContentTypes: [.folder, .audio],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result {
+                switch pickerTarget {
+                case .output:
+                    if let url = urls.first { viewModel.loadOutputFolder(url) }
+                case .source:
+                    let fm = FileManager.default
+                    var isDir: ObjCBool = false
+                    if let url = urls.first,
+                       fm.fileExists(atPath: url.path, isDirectory: &isDir),
+                       isDir.boolValue {
+                        // Picked a folder
+                        viewModel.loadFolder(url)
+                    } else if let parent = urls.first?.deletingLastPathComponent() {
+                        // Picked one or more audio files — use parent folder
+                        viewModel.loadFolder(parent)
+                    }
+                }
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDroppingSource) { providers in
             handleDrop(providers: providers)
         }
-        .fileImporter(
-            isPresented: $showPicker,
-            allowedContentTypes: pickerTarget == .source ? [.folder, .audio] : [.folder],
-            allowsMultipleSelection: pickerTarget == .source
-        ) { result in
-            guard case .success(let urls) = result, !urls.isEmpty else { return }
-            switch pickerTarget {
-            case .source:
-                let folders = urls.filter(\.hasDirectoryPath)
-                let files = urls.filter { !$0.hasDirectoryPath }
-                if let folder = folders.first {
-                    viewModel.setSourceFolder(folder)
-                }
-                if !files.isEmpty {
-                    viewModel.addFiles(files)
-                }
-            case .output:
-                if let url = urls.first {
-                    viewModel.setOutputFolder(url)
-                }
-            }
-        }
-        .sheet(isPresented: $showRuleEditor) {
-            RenameRuleEditorView(rule: $viewModel.rule)
-        }
-        .alert(
-            "Error",
-            isPresented: Binding(
-                get: { viewModel.errorMessage != nil },
-                set: { if !$0 { viewModel.errorMessage = nil } }
-            )
+        .overlay(dropOverlay)
+        .confirmationDialog(
+            "Clear all files from the list?",
+            isPresented: $confirmClearAll
         ) {
-            Button("OK", role: .cancel) {}
+            Button("Clear All", role: .destructive) { viewModel.clearAll() }
         } message: {
-            Text(viewModel.errorMessage ?? "")
+            Text("This only empties the list. No files are moved or deleted.")
         }
-    }
-
-    // MARK: - Toolbar
-
-    private var toolbar: some View {
-        HStack(spacing: 12) {
-            Button {
-                pickerTarget = .source
-                showPicker = true
-            } label: {
-                Label(
-                    viewModel.sourceFolder?.lastPathComponent ?? "Add Folder or Files",
-                    systemImage: "folder"
-                )
+        .sheet(isPresented: $isEditingRule) {
+            RenameRuleEditorView(rule: viewModel.rule) { updated in
+                viewModel.updateRule(updated)
             }
-            .help("Choose a folder to scan, or pick individual audio files to import")
-
-            Toggle("Include subfolders", isOn: $viewModel.includeSubfolders)
-                .toggleStyle(.checkbox)
-                .onChange(of: viewModel.includeSubfolders) { _ in
-                    Task { await viewModel.scan() }
-                }
-
-            Divider().frame(height: 16)
-
-            Button {
-                pickerTarget = .output
-                showPicker = true
-            } label: {
-                Label(
-                    viewModel.outputFolder?.lastPathComponent ?? "Output Folder",
-                    systemImage: "folder.badge.plus"
-                )
-            }
-            .help("Files are moved here, organized by the rename template. Leave unset to rename in place.")
-
-            if viewModel.outputFolder != nil {
-                Button {
-                    viewModel.setOutputFolder(nil)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Clear output folder (rename in place)")
-            }
-
-            Spacer()
-
-            if viewModel.canUndoLastMove {
-                Button {
-                    Task { await viewModel.undoLastMove() }
-                } label: {
-                    Label("Undo Last Move", systemImage: "arrow.uturn.backward")
-                }
-                .disabled(viewModel.isRenaming || viewModel.isMatching)
-            }
-
-            Toggle(isOn: $viewModel.showReviewOnly) {
-                Label("Needs review", systemImage: "line.3.horizontal.decrease.circle")
-            }
-            .toggleStyle(.button)
-            .help("Show only files that need review")
-
-            Button {
-                showRuleEditor = true
-            } label: {
-                Label("Rename Rule", systemImage: "textformat")
-            }
-
-            Button {
-                Task { await viewModel.findMatches() }
-            } label: {
-                Label("Find Matches", systemImage: "magnifyingglass")
-            }
-            .keyboardShortcut("f", modifiers: [.command, .shift])
-            .disabled(viewModel.items.isEmpty || viewModel.isMatching || viewModel.isRenaming)
         }
-        .padding(10)
-    }
-
-    // MARK: - Progress
-
-    @ViewBuilder
-    private var progressArea: some View {
-        if viewModel.isMatching {
-            HStack(spacing: 8) {
-                ProgressView(value: viewModel.matchProgress)
-                Text("\(Int(viewModel.matchProgress * 100))%")
-                    .font(.caption)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-        } else if viewModel.isRenaming {
-            HStack(spacing: 8) {
-                ProgressView(value: viewModel.renameProgress)
-                if let current = viewModel.currentlyProcessing {
-                    Text(current)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: 260, alignment: .trailing)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-        }
-    }
-
-    // MARK: - Content
-
-    @ViewBuilder
-    private var content: some View {
-        if viewModel.items.isEmpty {
-            emptyState
-        } else {
-            FileListView()
-        }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 14) {
-            Spacer()
-            Image(systemName: "arrow.down.doc")
-                .font(.system(size: 56))
-                .foregroundStyle(.tertiary)
-            Text("Drop a folder or audio files here")
-                .font(.title3)
-                .foregroundStyle(.secondary)
-            Text("or click “Source Folder” in the toolbar")
-                .font(.callout)
-                .foregroundStyle(.tertiary)
-            if viewModel.isScanning {
-                ProgressView().padding(.top, 8)
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Bottom bar
-
-    private var bottomBar: some View {
-        HStack(spacing: 14) {
-            if let status = viewModel.statusMessage {
-                Text(status)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer()
-
-            Toggle("Move companion files", isOn: $viewModel.moveCompanionFiles)
-                .toggleStyle(.checkbox)
-                .help("Cover art, .cue, .nfo and similar files move with the book")
-
-            Toggle("Clean empty folders", isOn: $viewModel.cleanupEmptyFolders)
-                .toggleStyle(.checkbox)
-                .help("Delete source folders left empty after moving")
-
-            Toggle("Copy instead of move", isOn: $viewModel.copyInsteadOfMove)
-                .toggleStyle(.checkbox)
-                .help("Safer for first runs — sources are left untouched")
-
-            Toggle("Dry run", isOn: $viewModel.dryRun)
-                .toggleStyle(.switch)
-
-            Button {
-                Task { await viewModel.performRename() }
-            } label: {
-                Label(
-                    viewModel.dryRun ? "Preview Move" : (viewModel.copyInsteadOfMove ? "Copy Files" : "Move Files"),
-                    systemImage: viewModel.dryRun ? "eye" : "arrow.right.doc.on.clipboard"
-                )
-            }
-            .keyboardShortcut(.return, modifiers: [.command])
-            .buttonStyle(.borderedProminent)
-            .disabled(viewModel.includedCount == 0 || viewModel.isMatching || viewModel.isRenaming)
-
-            Text("\(viewModel.includedCount) selected")
-                .font(.caption)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-        }
-        .padding(10)
     }
 
     // MARK: - Drop handling
 
-    private var dropOverlay: some View {
-        Group {
-            if isDropTargeted {
-                ZStack {
-                    Color.accentColor.opacity(0.08)
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(
-                            Color.accentColor,
-                            style: StrokeStyle(lineWidth: 3, dash: [10, 6])
-                        )
-                        .padding(8)
-                    Label("Drop folder or audio files", systemImage: "arrow.down.circle")
-                        .font(.title2)
-                        .padding(14)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                }
-                .allowsHitTesting(false)
+    private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        let supportedExts = FolderScanner.supportedExtensions
+        var resolvedURLs: [URL] = []
+        let group = DispatchGroup()
+
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                guard let data = item as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                resolvedURLs.append(url)
             }
+        }
+
+        group.notify(queue: .main) {
+            guard !resolvedURLs.isEmpty else { return }
+
+            let fm = FileManager.default
+            var folders: [URL] = []
+            var audioFiles: [URL] = []
+
+            for url in resolvedURLs {
+                var isDir: ObjCBool = false
+                fm.fileExists(atPath: url.path, isDirectory: &isDir)
+                if isDir.boolValue {
+                    folders.append(url)
+                } else if supportedExts.contains(url.pathExtension.lowercased()) {
+                    audioFiles.append(url)
+                }
+            }
+
+            if folders.count == 1 && audioFiles.isEmpty {
+                viewModel.loadFolder(folders[0])
+            } else if folders.count > 1 {
+                let commonParent = commonAncestor(of: folders)
+                viewModel.recursiveScan = true
+                viewModel.loadFolder(commonParent)
+            } else if !audioFiles.isEmpty {
+                let parents = Set(audioFiles.map { $0.deletingLastPathComponent().path })
+                if parents.count == 1, let parent = audioFiles.first?.deletingLastPathComponent() {
+                    viewModel.loadFolder(parent)
+                } else {
+                    let commonParent = commonAncestor(of: audioFiles.map { $0.deletingLastPathComponent() })
+                    viewModel.recursiveScan = true
+                    viewModel.loadFolder(commonParent)
+                }
+            }
+        }
+
+        return true
+    }
+
+    private func commonAncestor(of urls: [URL]) -> URL {
+        guard !urls.isEmpty else { return URL(fileURLWithPath: "/") }
+        guard urls.count > 1 else { return urls[0] }
+
+        let components = urls.map { $0.pathComponents }
+        let minLength  = components.map(\.count).min() ?? 1
+        var common: [String] = []
+
+        for i in 0..<minLength {
+            let segment = components[0][i]
+            if components.allSatisfy({ $0[i] == segment }) {
+                common.append(segment)
+            } else {
+                break
+            }
+        }
+
+        return URL(fileURLWithPath: common.joined(separator: "/"))
+    }
+
+    // MARK: - Drop overlay
+
+    @ViewBuilder
+    private var dropOverlay: some View {
+        if isDroppingSource {
+            ZStack {
+                Color.accentColor.opacity(0.15)
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8]))
+                    .padding(8)
+                VStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundStyle(Color.accentColor)
+                    Text("Drop folder or audio files")
+                        .font(.title3.bold())
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .allowsHitTesting(false)
         }
     }
 
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        var urls: [URL] = []
-        let group = DispatchGroup()
-        // loadObject completions can arrive concurrently on background
-        // threads — serialize all appends onto the main queue.
-        for provider in providers {
-            group.enter()
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                DispatchQueue.main.async {
-                    if let url { urls.append(url) }
-                    group.leave()
+    // MARK: - Header / footer / empty state
+
+    private func pickFolder(_ target: FolderPickerTarget) {
+        pickerTarget = target
+        isPickingFolder = true
+    }
+
+    private var header: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                Button { pickFolder(.source) } label: {
+                    Label("Source Folder…", systemImage: "folder")
+                }
+                if let url = viewModel.folderURL {
+                    Text(url.path)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Toggle("Include subfolders", isOn: $viewModel.recursiveScan)
+                    .toggleStyle(.checkbox)
+                    .disabled(viewModel.isScanning)
+                Button { isEditingRule = true } label: {
+                    Label("Rename Rule…", systemImage: "textformat")
                 }
             }
-        }
-        group.notify(queue: .main) {
-            let collected = urls
-            Task { @MainActor in
-                viewModel.handleDrop(urls: collected)
+
+            HStack(spacing: 12) {
+                Button { pickFolder(.output) } label: {
+                    Label("Output Folder…", systemImage: "arrow.right.circle")
+                }
+                if let url = viewModel.outputFolderURL {
+                    Text(url.path)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button {
+                        viewModel.clearOutputFolder()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear — files will be renamed in place")
+                } else {
+                    Text("Not set — files will be renamed in place")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
             }
         }
-        return true
+        .padding()
     }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+            Text("Drop a folder here, or click Source Folder…")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Text("Supports folders, subfolders, and audio files dropped directly")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if viewModel.isMatching {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Looking up metadata…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ProgressView(value: viewModel.matchProgress)
+                        .progressViewStyle(.linear)
+                }
+            }
+
+            if viewModel.isRenaming {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(viewModel.dryRun ? "Previewing…" : "Moving files…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if let current = viewModel.currentlyProcessing {
+                            Text(current)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: 400, alignment: .trailing)
+                        }
+                    }
+                    ProgressView(value: viewModel.renameProgress)
+                        .progressViewStyle(.linear)
+                }
+            }
+
+            if let status = viewModel.statusMessage, !viewModel.isMatching, !viewModel.isRenaming {
+                Text(status)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Toggle("Dry run (preview only — no files moved)", isOn: $viewModel.dryRun)
+                    .toggleStyle(.checkbox)
+
+                if viewModel.completedCount > 0 {
+                    Button {
+                        viewModel.clearCompleted()
+                    } label: {
+                        Label("Clear Completed (\(viewModel.completedCount))", systemImage: "checkmark.circle")
+                    }
+                    .disabled(!viewModel.canEditList)
+                    .help("Remove files that have already been moved from the list")
+                }
+
+                Button {
+                    confirmClearAll = true
+                } label: {
+                    Label("Clear All", systemImage: "trash")
+                }
+                .disabled(viewModel.items.isEmpty || !viewModel.canEditList)
+                .help("Empty the list (files on disk are not touched)")
+
+                Spacer()
+
+                Button {
+                    Task { await viewModel.matchAll() }
+                } label: {
+                    if viewModel.isMatching {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Find Matches", systemImage: "magnifyingglass")
+                    }
+                }
+                .disabled(viewModel.items.isEmpty || viewModel.isMatching)
+
+                Button {
+                    Task { await viewModel.performRename() }
+                } label: {
+                    Label(
+                        viewModel.dryRun ? "Preview Move" : "Move Files",
+                        systemImage: viewModel.dryRun ? "eye" : "arrow.right.circle.fill"
+                    )
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!hasRenamableItems || viewModel.isRenaming || viewModel.isMatching)
+            }
+        }
+        .padding()
+    }
+
+    private var hasRenamableItems: Bool {
+        viewModel.items.contains { $0.includeInBatch && $0.proposedFilename != nil }
+    }
+}
+
+#Preview {
+    ContentView()
 }

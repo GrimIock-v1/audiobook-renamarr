@@ -1,193 +1,138 @@
 import Foundation
 
-/// A single recorded move, for the undo manifest.
-nonisolated struct MoveRecord: Codable {
-    let source: String
-    let destination: String
-}
+enum RenameEngine {
 
-/// Persists the last real move batch so it can be undone.
-/// Stored at `~/Library/Application Support/AudiobookRenamer/last_move.json`.
-nonisolated final class MoveManifest: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "MoveManifest.io")
-    private let fileURL: URL
+    static func proposedFilename(for item: AudioFileItem, rule: RenameRule) -> String? {
+        guard let match = item.selectedMatch else { return nil }
+        let ext = item.originalURL.pathExtension
 
-    init() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AudiobookRenamer", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        fileURL = dir.appendingPathComponent("last_move.json")
-    }
+        var values: [String: String] = [
+            "author":       match.primaryAuthor ?? "",
+            "title":        match.title,
+            "subtitle":     match.subtitle ?? "",
+            "series":       match.seriesTitle ?? "",
+            "narrator":     match.primaryNarrator ?? "",
+            "year":         match.releaseYear ?? "",
+            "ext":          ext.isEmpty ? "" : ".\(ext)",
+        ]
 
-    var hasManifest: Bool {
-        queue.sync { FileManager.default.fileExists(atPath: fileURL.path) }
-    }
-
-    func save(_ records: [MoveRecord]) {
-        queue.sync {
-            guard let data = try? JSONEncoder().encode(records) else { return }
-            try? data.write(to: fileURL, options: .atomic)
-        }
-    }
-
-    func load() -> [MoveRecord] {
-        queue.sync {
-            guard let data = try? Data(contentsOf: fileURL),
-                  let records = try? JSONDecoder().decode([MoveRecord].self, from: data)
-            else { return [] }
-            return records
-        }
-    }
-
-    func clear() {
-        queue.sync { try? FileManager.default.removeItem(at: fileURL) }
-    }
-}
-
-nonisolated struct RenameEngine {
-    /// Pure — never touches disk. Builds the proposed relative path
-    /// (possibly containing folder separators) for one file.
-    func proposedRelativePath(
-        match: ScoredMatch,
-        trackNumber: Int?,
-        fileExtension: String,
-        rule: RenameRule
-    ) -> String {
-        let product = match.product
-        let context = RenameRule.TokenContext(
-            author: product.allAuthors,
-            title: product.title,
-            subtitle: product.subtitle,
-            series: product.primarySeries?.title,
-            seriesNumber: product.primarySeries?.sequenceNumber,
-            narrator: product.primaryNarrator,
-            year: product.releaseYear,
-            ext: fileExtension,
-            trackNumber: trackNumber
-        )
-        return rule.render(context: context)
-    }
-
-    struct MoveOutcome {
-        let result: RenameResult
-        let record: MoveRecord?
-    }
-
-    /// Executes (or previews) one move. `outputFolder == nil` means rename
-    /// in place within the file's current folder.
-    ///
-    /// - Parameter takenLowercased: destination paths already claimed in this
-    ///   batch, lowercased (APFS is case-insensitive by default).
-    func apply(
-        fileURL: URL,
-        relativePath: String,
-        outputFolder: URL?,
-        dryRun: Bool,
-        copyInsteadOfMove: Bool,
-        takenLowercased: inout Set<String>
-    ) -> MoveOutcome {
-        let baseFolder = outputFolder ?? fileURL.deletingLastPathComponent()
-
-        // Resolve collisions against both the batch and the filesystem.
-        var components = relativePath.components(separatedBy: "/")
-        let filename = components.removeLast()
-        let containingFolder = components.reduce(baseFolder) { $0.appendingPathComponent($1, isDirectory: true) }
-
-        func isTaken(_ name: String) -> Bool {
-            let full = containingFolder.appendingPathComponent(name).path
-            if full == fileURL.path { return false } // renaming onto itself is fine
-            return FileManager.default.fileExists(atPath: full)
-                || takenLowercased.contains(full.lowercased())
+        if let seq = match.seriesSequence, let num = Int(seq), rule.trackNumberPadding > 0 {
+            values["seriesNumber"] = String(format: "%0\(rule.trackNumberPadding)d", num)
+        } else {
+            values["seriesNumber"] = match.seriesSequence ?? ""
         }
 
-        var candidate = filename
-        if isTaken(candidate) {
-            let ext = (filename as NSString).pathExtension
-            let stem = (filename as NSString).deletingPathExtension
-            var counter = 2
-            repeat {
-                candidate = ext.isEmpty ? "\(stem) (\(counter))" : "\(stem) (\(counter)).\(ext)"
-                counter += 1
-            } while isTaken(candidate)
+        var result = rule.template
+        for token in RenameRule.availableTokens {
+            let key = token.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))
+            result = result.replacingOccurrences(of: token, with: values[key] ?? "")
         }
 
-        let destination = containingFolder.appendingPathComponent(candidate)
-        takenLowercased.insert(destination.path.lowercased())
-
-        if destination.path == fileURL.path {
-            return MoveOutcome(result: .skipped, record: nil)
+        // ── Track number: injected only if one exists ──
+        let extPart = ext.isEmpty ? "" : ".\(ext)"
+        var nameOnly = result
+        if !extPart.isEmpty && nameOnly.lowercased().hasSuffix(extPart.lowercased()) {
+            nameOnly = String(nameOnly.dropLast(extPart.count))
         }
 
-        if dryRun {
-            return MoveOutcome(result: .dryRun(destination: destination.path), record: nil)
-        }
+        // Sanitize each path segment independently so "/" is preserved.
+        let segments = nameOnly.components(separatedBy: "/")
+        let sanitizedSegments = segments
+            .map { FilenameSanitizer.sanitize($0) }
+            .filter { !$0.isEmpty }
 
-        do {
-            try FileManager.default.createDirectory(
-                at: containingFolder,
-                withIntermediateDirectories: true
-            )
-            if copyInsteadOfMove {
-                try FileManager.default.copyItem(at: fileURL, to: destination)
-            } else {
-                try FileManager.default.moveItem(at: fileURL, to: destination)
+        var folderPart = sanitizedSegments.dropLast().joined(separator: "/")
+        var filePart   = sanitizedSegments.last ?? "Untitled"
+
+        if let trackNum = item.parsed?.trackNumber {
+            let formatted = rule.trackNumberPadding > 0
+                ? String(format: "%0\(rule.trackNumberPadding)d", trackNum)
+                : String(trackNum)
+            switch rule.trackPosition {
+            case .front: filePart = "\(formatted) - \(filePart)"
+            case .back:  filePart = "\(filePart) - \(formatted)"
             }
-            let record = copyInsteadOfMove
-                ? nil // copies don't need undo — the source is untouched
-                : MoveRecord(source: fileURL.path, destination: destination.path)
-            return MoveOutcome(result: .moved(destination: destination.path), record: record)
-        } catch {
-            return MoveOutcome(result: .failed(reason: error.localizedDescription), record: nil)
         }
+
+        var full = folderPart.isEmpty ? filePart : "\(folderPart)/\(filePart)"
+        full += extPart
+
+        if rule.replaceSpacesWithUnderscore {
+            full = full.replacingOccurrences(of: " ", with: "_")
+        }
+
+        var parts = full.components(separatedBy: "/")
+        if let last = parts.last {
+            parts[parts.count - 1] = FilenameSanitizer.truncate(last, maxLength: rule.maxFilenameLength)
+        }
+        return parts.joined(separator: "/")
     }
 
-    /// Reverses a batch of recorded moves. Returns (restored, failed) counts.
-    func undo(records: [MoveRecord]) -> (restored: Int, failed: Int) {
-        var restored = 0
-        var failed = 0
-        for record in records.reversed() {
-            let src = URL(fileURLWithPath: record.destination)
-            let dst = URL(fileURLWithPath: record.source)
+    /// Applies renames. When `outputFolder` is set, all files are moved
+    /// there (organized by the rename rule's folder structure). When nil,
+    /// files are renamed in place.
+    static func apply(items: [AudioFileItem], rule: RenameRule, outputFolder: URL?, dryRun: Bool) -> [AudioFileItem] {
+        var result    = items
+        var usedNames = Set<String>()
+        let fm        = FileManager.default
+
+        for index in result.indices {
+            guard result[index].includeInBatch else { continue }
+
+            guard let proposed = result[index].proposedFilename else {
+                result[index].renameResult = .skipped(reason: "No proposed filename")
+                continue
+            }
+
+            // Determine destination root: output folder or the file's own folder.
+            let destinationRoot = outputFolder ?? result[index].originalURL.deletingLastPathComponent()
+            let destination     = destinationRoot.appendingPathComponent(proposed)
+
+            // Check if file is already in the right place.
+            if destination.path == result[index].originalURL.path {
+                result[index].renameResult = .skipped(reason: "Already in the right place")
+                usedNames.insert(proposed)
+                continue
+            }
+
+            let uniqueName        = uniquePath(proposed, in: destinationRoot, alreadyUsed: usedNames)
+            let finalDestination  = destinationRoot.appendingPathComponent(uniqueName)
+            usedNames.insert(uniqueName)
+
+            if dryRun {
+                result[index].renameResult = .dryRun(to: finalDestination.path)
+                continue
+            }
+
             do {
-                try FileManager.default.createDirectory(
-                    at: dst.deletingLastPathComponent(),
+                // Create intermediate folders (Author/Title/) if needed.
+                try fm.createDirectory(
+                    at: finalDestination.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                try FileManager.default.moveItem(at: src, to: dst)
-                restored += 1
+                try fm.moveItem(at: result[index].originalURL, to: finalDestination)
+                result[index].renameResult = .renamed(to: finalDestination.path)
             } catch {
-                failed += 1
+                result[index].renameResult = .failed(reason: error.localizedDescription)
             }
         }
-        return (restored, failed)
+
+        return result
     }
 
-    /// Deletes now-empty directories under `root` (deepest first).
-    /// Returns the paths removed.
-    func removeEmptyDirectories(under root: URL) -> [String] {
-        let fm = FileManager.default
-        var directories: [URL] = []
-        let enumerator = fm.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsPackageDescendants]
-        )
-        while let url = enumerator?.nextObject() as? URL {
-            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                directories.append(url)
-            }
+    private static func uniquePath(_ relative: String, in root: URL, alreadyUsed: Set<String>) -> String {
+        let fm      = FileManager.default
+        let ext     = (relative as NSString).pathExtension
+        let base    = (relative as NSString).deletingPathExtension
+        let extPart = ext.isEmpty ? "" : ".\(ext)"
+
+        var candidate = relative
+        var counter   = 2
+        while alreadyUsed.contains(candidate)
+            || fm.fileExists(atPath: root.appendingPathComponent(candidate).path) {
+            candidate = "\(base) (\(counter))\(extPart)"
+            counter  += 1
         }
-        var removed: [String] = []
-        for dir in directories.sorted(by: { $0.pathComponents.count > $1.pathComponents.count }) {
-            let contents = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-            let visible = contents.filter { $0 != ".DS_Store" }
-            if visible.isEmpty {
-                try? fm.removeItem(at: dir.appendingPathComponent(".DS_Store"))
-                if (try? fm.removeItem(at: dir)) != nil {
-                    removed.append(dir.path)
-                }
-            }
-        }
-        return removed
+        return candidate
     }
 }

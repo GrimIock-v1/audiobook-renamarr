@@ -1,165 +1,227 @@
 import SwiftUI
+import AppKit
 
 struct FileRowView: View {
+    @EnvironmentObject var viewModel: LibraryViewModel
     let item: AudioFileItem
-    let candidates: [AudibleMatch]
-    let onToggleInclude: (Bool) -> Void
-    let onSelectMatch: (AudibleMatch) -> Void
-    let onApplyToFolder: (AudibleMatch) -> Void
-    let onRemove: () -> Void
-    let canRemove: Bool
-
     @State private var showAlternates = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .top) {
-                Toggle("", isOn: Binding(get: { item.includeInBatch }, set: onToggleInclude))
-                    .toggleStyle(.checkbox)
-                    .labelsHidden()
-                    .frame(width: 24)
-                    .disabled(item.selectedMatch == nil)
+            HStack(alignment: .top, spacing: 8) {
+                Toggle("", isOn: Binding(
+                    get: { item.isIncluded },
+                    set: { _ in viewModel.toggleIncluded(itemID: item.id) }
+                ))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .disabled(item.selectedMatch == nil)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.originalFilename)
-                        .font(.callout)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.filename)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let result = item.renameResult {
-                        Text(resultDescription(result))
+
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.turn.down.right")
                             .font(.caption2)
-                            .foregroundStyle(resultColor(result))
+                            .foregroundStyle(.tertiary)
+                        Text(item.proposedRelativePath ?? "—")
+                            .font(.callout)
+                            .foregroundStyle(item.proposedRelativePath == nil ? .tertiary : .secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.proposedFilename ?? "—")
-                        .font(.callout)
-                        .foregroundStyle(item.proposedFilename == nil ? .secondary : .primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if candidates.count > 1 {
-                        Button(showAlternates ? "Hide alternates" : "Show \(candidates.count - 1) alternate(s)") {
+                    if let result = item.renameResult {
+                        resultView(result)
+                    }
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    confidenceBadge
+                    if !item.candidates.isEmpty, item.candidates.count > 1 || item.selectedMatch == nil {
+                        Button {
                             showAlternates.toggle()
+                        } label: {
+                            Text(showAlternates
+                                 ? "Hide alternates"
+                                 : "Show \(item.candidates.count) alternate\(item.candidates.count == 1 ? "" : "s")")
+                                .font(.caption)
                         }
-                        .buttonStyle(.link)
-                        .font(.caption2)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                statusBadge
-                    .frame(width: 120, alignment: .leading)
-
-                Button(action: onRemove) {
-                    Image(systemName: "xmark.circle")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .frame(width: 20)
-                .disabled(!canRemove)
-                .help("Remove from list (the file itself is not touched)")
             }
 
-            // ── Alternates picker ──
             if showAlternates {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(candidates) { candidate in
-                        HStack(alignment: .top, spacing: 8) {
-                            Button {
-                                onSelectMatch(candidate)
-                                showAlternates = false
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: candidate.asin == item.selectedMatch?.asin
-                                          ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(candidate.asin == item.selectedMatch?.asin ? .green : .secondary)
-                                    Text("\(candidate.title) — \(candidate.authors.joined(separator: ", "))")
-                                        .lineLimit(1)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .font(.caption)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                            // Apply to entire folder button
-                            Button {
-                                onApplyToFolder(candidate)
-                                showAlternates = false
-                            } label: {
-                                Label("Apply to folder", systemImage: "folder.badge.checkmark")
-                                    .font(.caption)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.mini)
-                            .help("Apply this match to every file in the same folder")
-                        }
-                    }
-                }
-                .padding(.leading, 24)
-                .padding(.vertical, 4)
-                .padding(.trailing, 8)
-            }
-
-            if case .error(let message) = item.status {
-                Text(message)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .padding(.leading, 24)
+                alternatesList
+                    .padding(.leading, 28)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .contextMenu {
+            if let moved = movedDestination {
+                Button("Show in Finder") { reveal(moved) }
+            } else {
+                Button("Show in Finder") { reveal(item.url) }
+                if let folder = previewDestinationFolder {
+                    Button("Show Destination Folder in Finder") { reveal(folder) }
+                }
+            }
+        }
     }
+
+    // MARK: - Finder reveal
+
+    private var movedDestination: URL? {
+        if case .moved(let destination) = item.renameResult {
+            return URL(fileURLWithPath: destination)
+        }
+        return nil
+    }
+
+    /// The folder this file would land in — only offered when it already
+    /// exists on disk (before a real move the file itself isn't there yet).
+    private var previewDestinationFolder: URL? {
+        guard let relative = item.proposedRelativePath else { return nil }
+        let base = viewModel.outputFolder ?? URL(fileURLWithPath: item.folderPath)
+        var components = relative.components(separatedBy: "/")
+        components.removeLast() // drop the filename
+        let folder = components.reduce(base) { $0.appendingPathComponent($1, isDirectory: true) }
+        return FileManager.default.fileExists(atPath: folder.path) ? folder : nil
+    }
+
+    private func reveal(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    // MARK: - Badge
 
     @ViewBuilder
-    private var statusBadge: some View {
-        switch item.status {
+    private var confidenceBadge: some View {
+        switch item.matchState {
         case .pending:
-            Label("Pending", systemImage: "clock")
-                .foregroundStyle(.secondary)
+            Text("Not searched")
+                .badgeStyle(color: .secondary)
         case .searching:
-            HStack(spacing: 4) {
-                ProgressView().controlSize(.mini)
-                Text("Searching…")
-            }
-            .foregroundStyle(.secondary)
+            ProgressView()
+                .controlSize(.small)
         case .matched(let confidence):
-            Label("Matched \(percentage(confidence))", systemImage: "checkmark.seal.fill")
-                .foregroundStyle(.green)
-        case .needsReview(let confidence):
-            Label("Review \(percentage(confidence))", systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            Label("Matched \(Int((confidence * 100).rounded()))%", systemImage: "checkmark.circle.fill")
+                .badgeStyle(color: .green)
+        case .review(let confidence):
+            Label("Review \(Int((confidence * 100).rounded()))%", systemImage: "exclamationmark.triangle.fill")
+                .badgeStyle(color: .orange)
         case .noMatch:
-            Label("No match", systemImage: "questionmark.circle")
-                .foregroundStyle(.secondary)
-        case .error:
-            Label("Error", systemImage: "xmark.octagon.fill")
+            Label("No match", systemImage: "circle.dotted")
+                .badgeStyle(color: .secondary)
+        case .error(let message):
+            Label("Error", systemImage: "exclamationmark.octagon.fill")
+                .badgeStyle(color: .red)
+                .help(message)
+        }
+    }
+
+    // MARK: - Result
+
+    @ViewBuilder
+    private func resultView(_ result: RenameResult) -> some View {
+        switch result {
+        case .moved(let destination):
+            Label(destination, systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.green)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .dryRun(let destination):
+            Label("Preview: \(destination)", systemImage: "eye")
+                .font(.caption)
+                .foregroundStyle(.blue)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .failed(let reason):
+            Label(reason, systemImage: "xmark.circle")
+                .font(.caption)
                 .foregroundStyle(.red)
+                .lineLimit(2)
+        case .skipped:
+            Label("Skipped (already named correctly)", systemImage: "minus.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
-    private func percentage(_ value: Double) -> String {
-        "\(Int((value * 100).rounded()))%"
-    }
+    // MARK: - Alternates
 
-    private func resultDescription(_ result: RenameOutcome) -> String {
-        switch result {
-        case .renamed(let to): return "Moved → \(to)"
-        case .dryRun(let to):  return "Would move → \(to)"
-        case .skipped(let r):  return "Skipped: \(r)"
-        case .failed(let r):   return "Failed: \(r)"
-        }
-    }
+    private var alternatesList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(item.candidates) { candidate in
+                HStack(spacing: 8) {
+                    Button {
+                        viewModel.selectMatch(candidate, for: item.id)
+                    } label: {
+                        Image(systemName: item.selectedMatch?.product.asin == candidate.product.asin
+                              ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
 
-    private func resultColor(_ result: RenameOutcome) -> Color {
-        switch result {
-        case .renamed: return .green
-        case .dryRun:  return .blue
-        case .skipped: return .secondary
-        case .failed:  return .red
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(candidate.product.title ?? "Untitled")
+                            .font(.callout)
+                            .lineLimit(1)
+                        HStack(spacing: 4) {
+                            if let author = candidate.product.allAuthors {
+                                Text(author)
+                            }
+                            if let series = candidate.product.primarySeries,
+                               let title = series.title {
+                                Text("· \(title)\(series.sequence.map { " #\($0)" } ?? "")")
+                            }
+                            if let year = candidate.product.releaseYear {
+                                Text("· \(String(year))")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Text("\(candidate.percent)%")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+
+                    Button("Apply to folder") {
+                        viewModel.applyMatchToFolder(candidate, for: item.id)
+                        showAlternates = false
+                    }
+                    .controlSize(.small)
+                    .help("Apply this match to every file in the folder")
+                }
+                .padding(.vertical, 2)
+            }
         }
+        .padding(8)
+        .background(Color.gray.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private extension View {
+    func badgeStyle(color: Color) -> some View {
+        self
+            .font(.caption)
+            .foregroundStyle(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12), in: Capsule())
     }
 }

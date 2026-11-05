@@ -102,6 +102,18 @@ struct FolderHeaderView: View {
 
                 Spacer()
 
+                Button {
+                    viewModel.removeFolder(folderPath)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                        .frame(width: 20)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(!viewModel.canEditList)
+                .help("Remove this folder's files from the list (nothing on disk is touched)")
+
                 if let error = groupError {
                     Button {
                         if let key = items.first?.groupKey {

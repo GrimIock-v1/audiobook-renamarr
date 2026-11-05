@@ -55,6 +55,18 @@ struct FileRowView: View {
                         .foregroundStyle(Color.accentColor)
                     }
                 }
+
+                Button {
+                    viewModel.removeItem(item.id)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                        .frame(width: 20)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(!viewModel.canEditList)
+                .help("Remove from list (the file on disk is not touched)")
             }
 
             if showAlternates {

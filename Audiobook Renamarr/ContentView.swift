@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var showPicker = false
     @State private var showRuleEditor = false
     @State private var isDropTargeted = false
+    @State private var confirmClearAll = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,6 +51,16 @@ struct ContentView: View {
                     viewModel.setOutputFolder(url)
                 }
             }
+        }
+        .confirmationDialog(
+            "Clear all files from the list?",
+            isPresented: $confirmClearAll,
+            titleVisibility: .visible
+        ) {
+            Button("Clear All", role: .destructive) { viewModel.clearAll() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Files on disk are not touched.")
         }
         .sheet(isPresented: $showRuleEditor) {
             RenameRuleEditorView(rule: $viewModel.rule)
@@ -218,6 +229,20 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+
+            if viewModel.completedCount > 0 {
+                Button("Clear Completed (\(viewModel.completedCount))") {
+                    viewModel.clearCompleted()
+                }
+                .disabled(!viewModel.canEditList)
+                .help("Remove files that have already been moved from the list")
+            }
+
+            Button("Clear All") {
+                confirmClearAll = true
+            }
+            .disabled(viewModel.items.isEmpty || !viewModel.canEditList)
+            .help("Empty the list. Files on disk are not touched.")
 
             Spacer()
 

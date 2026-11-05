@@ -501,6 +501,71 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Clearing the list
+
+    /// The list can't be edited while a match or move is running.
+    var canEditList: Bool { !isMatching && !isRenaming }
+
+    var completedCount: Int {
+        items.filter {
+            if case .moved = $0.renameResult { return true }
+            return false
+        }.count
+    }
+
+    func removeItem(_ itemID: UUID) {
+        guard canEditList else { return }
+        items.removeAll { $0.id == itemID }
+        pruneFolderState()
+    }
+
+    func removeFolder(_ folderPath: String) {
+        guard canEditList else { return }
+        items.removeAll { $0.folderPath == folderPath }
+        pruneFolderState()
+    }
+
+    /// Removes every file that has already been moved/copied.
+    func clearCompleted() {
+        guard canEditList else { return }
+        let count = completedCount
+        items.removeAll {
+            if case .moved = $0.renameResult { return true }
+            return false
+        }
+        pruneFolderState()
+        statusMessage = "Cleared \(count) completed file\(count == 1 ? "" : "s")"
+    }
+
+    /// Empties the list and resets the session. The output folder and
+    /// rename rule are kept.
+    func clearAll() {
+        guard canEditList else { return }
+        items = []
+        sourceAccessURL?.stopAccessingSecurityScopedResource()
+        sourceAccessURL = nil
+        sourceFolder = nil
+        for url in fileAccessURLs { url.stopAccessingSecurityScopedResource() }
+        fileAccessURLs = []
+        folderNameOverrides = []
+        collapsedFolders = []
+        lastQueries = [:]
+        matchProgress = 0
+        renameProgress = 0
+        currentlyProcessing = nil
+        errorMessage = nil
+        statusMessage = "List cleared"
+    }
+
+    private func pruneFolderState() {
+        let livePaths = Set(items.map(\.folderPath))
+        folderNameOverrides.formIntersection(livePaths)
+        collapsedFolders.formIntersection(livePaths)
+        let liveKeys = Set(items.map(\.groupKey))
+        lastQueries = lastQueries.filter { liveKeys.contains($0.key) }
+        if items.isEmpty { statusMessage = "List cleared" }
+    }
+
     // MARK: - Proposals
 
     func refreshProposals() {
